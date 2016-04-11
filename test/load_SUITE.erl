@@ -7,6 +7,8 @@
 
 -compile(export_all).
 
+-import(test_helper, [get_client/1]).
+
 %%--------------------------------------------------------------------
 %% Function: suite() -> Info
 %%
@@ -19,14 +21,8 @@
 %% Note: The suite/0 function is only meant to be used to return
 %% default data values, not perform any other operations.
 %%--------------------------------------------------------------------
-suite() -> 
-  [{timetrap, {seconds, 30}},
-   {require, ssl, cqerl_test_ssl},
-   {require, auth, cqerl_test_auth},
-   % {require, keyspace, cqerl_test_keyspace},
-   {require, host, cqerl_host},
-   {require, pool_min_size, pool_min_size},
-   {require, pool_max_size, pool_max_size}].
+suite() ->
+  [{timetrap, {seconds, 30}} | test_helper:requirements()].
 
 %%--------------------------------------------------------------------
 %% Function: groups() -> [Group]
@@ -49,7 +45,16 @@ suite() ->
 %%
 %% Description: Returns a list of test case group definitions.
 %%--------------------------------------------------------------------
-groups() -> [].
+tests() ->
+    [
+     single_client, n_clients, many_clients, many_sync_clients, many_concurrent_clients
+    ].
+
+groups() ->
+    [
+     {pooler, [sequence], tests()},
+     {hash, [sequence], tests()}
+    ].
 
 %%--------------------------------------------------------------------
 %% Function: all() -> GroupsAndTestCases
@@ -65,9 +70,11 @@ groups() -> [].
 %%
 %%      NB: By default, we export all 1-arity user defined functions
 %%--------------------------------------------------------------------
+
 all() ->
     [
-    single_client, n_clients, many_clients, many_sync_clients
+     {group, pooler},
+     {group, hash}
     ].
 
 %%--------------------------------------------------------------------
@@ -85,61 +92,16 @@ all() ->
 %% variable, but should NOT alter/remove any existing entries.
 %%--------------------------------------------------------------------
 init_per_suite(Config) ->
-    case erlang:function_exported(application, ensure_all_started, 1) of
-      true -> application:ensure_all_started(cqerl);
-      false ->
-        application:start(crypto),
-        application:start(asn1),
-        application:start(public_key),
-        application:start(ssl),
-        application:start(pooler),
-        application:start(cqerl)
-    end,
-    
-    application:start(sasl),
-    RawSSL = ct:get_config(ssl),
-    DataDir = proplists:get_value(data_dir, Config),
-    SSL = case RawSSL of
-        undefined -> false;
-        false -> false;
-        _ ->
-            %% To relative file paths for SSL, prepend the path of
-            %% the test data directory. To bypass this behavior, provide
-            %% an absolute path.
-            lists:map(fun
-                ({FileOpt, Path}) when FileOpt == cacertfile;
-                                       FileOpt == certfile;
-                                       FileOpt == keyfile ->
-                    case Path of
-                        [$/ | _Rest] -> {FileOpt, Path};
-                        _ -> {FileOpt, filename:join([DataDir, Path])}
-                    end;
+    test_helper:set_mode(pooler, Config),
+    Config1 = test_helper:standard_setup("test_keyspace_1", Config),
+    test_helper:create_keyspace(<<"test_keyspace_1">>, Config1),
 
-                (Opt) -> Opt
-            end, RawSSL)
-    end,
-    Config1 = [ {auth, ct:get_config(auth)}, 
-      {ssl, RawSSL},
-      {prepared_ssl, SSL},
-      {keyspace, "test_keyspace_1"},
-      {host, ct:get_config(host)},
-      {pool_min_size, ct:get_config(pool_min_size)},
-      {pool_max_size, ct:get_config(pool_max_size)} ] ++ Config,
-    
-    Client = get_client([{keyspace, undefined}|Config1]),
-    Q = <<"CREATE KEYSPACE test_keyspace_1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};">>,
-    D = <<"DROP KEYSPACE test_keyspace_1;">>,
-    case cqerl:run_query(Client, #cql_query{statement=Q}) of
-        {ok, #cql_schema_changed{change_type=created, keyspace = <<"test_keyspace_1">>}} -> ok;
-        {error, {16#2400, _, {key_space, <<"test_keyspace_1">>}}} ->
-            {ok, #cql_schema_changed{change_type=dropped, keyspace = <<"test_keyspace_1">>}} = cqerl:run_query(Client, D),
-            {ok, #cql_schema_changed{change_type=created, keyspace = <<"test_keyspace_1">>}} = cqerl:run_query(Client, Q)
-    end,
-    cqerl:run_query(Client, "USE test_keyspace_1;"),
-    {ok, #cql_schema_changed{change_type=created, keyspace = <<"test_keyspace_1">>, name = <<"entries1">>}} =
-      cqerl:run_query(Client, "CREATE TABLE entries1 (id int PRIMARY KEY, name text);"),
+    Client = get_client(Config1),
+    {ok, #cql_schema_changed{change_type=created, keyspace = <<"test_keyspace_1">>,
+                             name = <<"entries1">>}} =
+    cqerl:run_query(Client, "CREATE TABLE entries1 (id int PRIMARY KEY, name text);"),
     cqerl:close_client(Client),
-    
+
     [{pool_min_size, 10}, {pool_max_size, 100} | Config1].
 
 %%--------------------------------------------------------------------
@@ -166,7 +128,12 @@ end_per_suite(_Config) ->
 %%
 %% Description: Initialization before each test case group.
 %%--------------------------------------------------------------------
-init_per_group(_group, Config) ->
+init_per_group(pooler, Config) ->
+    test_helper:set_mode(pooler, Config);
+init_per_group(hash, Config) ->
+    test_helper:set_mode(hash, Config);
+
+init_per_group(_, Config) ->
     Config.
 
 %%--------------------------------------------------------------------
@@ -199,7 +166,7 @@ end_per_group(_group, Config) ->
 %% Note: This function is free to add any key/value pairs to the Config
 %% variable, but should NOT alter/remove any existing entries.
 %%--------------------------------------------------------------------
-init_per_testcase(TestCase, Config) ->
+init_per_testcase(_TestCase, Config) ->
     Config.
 
 %%--------------------------------------------------------------------
@@ -215,12 +182,12 @@ init_per_testcase(TestCase, Config) ->
 %%
 %% Description: Cleanup after each test case.
 %%--------------------------------------------------------------------
-end_per_testcase(TestCase, Config) ->
+end_per_testcase(_TestCase, Config) ->
     Config.
 
 single_client(Config) ->
   Client = get_client(Config),
-  N = 500,    % # of requests
+  Num = 500,    % # of requests
   Dt = 2,    % in ms, yielding (1000/Dt) req/s
   
   Iterator = fun
@@ -229,22 +196,22 @@ single_client(Config) ->
       erlang:send_after(Dt*M, self(), send_request),
       F(F, N-1, M+1)
   end,
-  Iterator(Iterator, N, 0),
+  Iterator(Iterator, Num, 0),
   
   Q = #cql_query{statement="INSERT INTO entries1 (id, name) values (?, ?);"},
   
-  T1 = erlang:now(),
+  T1 = os:timestamp(),
   DelayLooper = fun
     (_F, 0, 0, Acc) -> Acc;
     (F, N, M, Acc) ->
       receive
-        Msg = {result, Tag, void} -> 
+        {result, Tag, void} -> 
           {ok, T} = orddict:find(Tag, Acc),
-          F(F, N, M-1, orddict:store(Tag, timer:now_diff(erlang:now(), T), Acc));
+          F(F, N, M-1, orddict:store(Tag, timer:now_diff(os:timestamp(), T), Acc));
           
         send_request -> 
           Tag = cqerl:send_query(Client, Q#cql_query{values=[{id, N}, {name, "test"}]}),
-          F(F, N-1, M, orddict:store(Tag, erlang:now(), Acc));
+          F(F, N-1, M, orddict:store(Tag, os:timestamp(), Acc));
           
         OtherMsg ->
           ct:fail("Unexpected response ~p", [OtherMsg])
@@ -253,11 +220,11 @@ single_client(Config) ->
         ct:fail("All delayed messages did not arrive in time")
       end
   end,
-  Deltas = DelayLooper(DelayLooper, N, N, []),
+  Deltas = DelayLooper(DelayLooper, Num, Num, []),
   
-  Sum = lists:foldr(fun ({Tag, T}, Acc) -> Acc + T end, 0, Deltas),
+  Sum = lists:foldr(fun ({_Tag, T}, Acc) -> Acc + T end, 0, Deltas),
   ct:log("~w requests sent over ~w seconds -- mean request roundtrip : ~w microseconds", 
-    [N, (timer:now_diff(erlang:now(), T1))/1.0e6, Sum/N]).
+    [Num, (timer:now_diff(os:timestamp(), T1))/1.0e6, Sum/Num]).
   
 
 get_n_clients(_Config, 0, Acc) -> Acc;
@@ -268,7 +235,7 @@ n_clients(Config) ->
   NC = 10,
   Clients = get_n_clients(Config, NC, []),
   
-  N = 1500,    % # of requests
+  Num = 1500,    % # of requests
   Dt = 2,    % in ms, yielding (1000/Dt) req/s
   
   Iterator = fun
@@ -277,23 +244,23 @@ n_clients(Config) ->
       erlang:send_after(Dt*M, self(), send_request),
       F(F, N-1, M+1)
   end,
-  Iterator(Iterator, N, 0),
+  Iterator(Iterator, Num, 0),
   
   Q = #cql_query{statement="INSERT INTO entries1 (id, name) values (?, ?);"},
   
-  T1 = erlang:now(),
+  T1 = os:timestamp(),
   DelayLooper = fun
     (_F, 0, 0, Acc) -> Acc;
     (F, N, M, Acc) ->
       receive
-        Msg = {result, Tag, void} -> 
+        {result, Tag, void} -> 
           {ok, T} = orddict:find(Tag, Acc),
-          F(F, N, M-1, orddict:store(Tag, timer:now_diff(erlang:now(), T), Acc));
+          F(F, N, M-1, orddict:store(Tag, timer:now_diff(os:timestamp(), T), Acc));
           
         send_request ->
           Client = lists:nth((N rem 5) + 1, Clients),
           Tag = cqerl:send_query(Client, Q#cql_query{values=[{id, N}, {name, "test"}]}),
-          F(F, N-1, M, orddict:store(Tag, erlang:now(), Acc));
+          F(F, N-1, M, orddict:store(Tag, os:timestamp(), Acc));
           
         OtherMsg ->
           ct:fail("Unexpected response ~p", [OtherMsg])
@@ -302,14 +269,14 @@ n_clients(Config) ->
         ct:fail("All delayed messages did not arrive in time")
       end
   end,
-  Deltas = DelayLooper(DelayLooper, N, N, []),
+  Deltas = DelayLooper(DelayLooper, Num, Num, []),
   
-  Sum = lists:foldr(fun ({Tag, T}, Acc) -> Acc + T end, 0, Deltas),
+  Sum = lists:foldr(fun ({_Tag, T}, Acc) -> Acc + T end, 0, Deltas),
   ct:log("~w requests sent over ~w seconds -- mean request roundtrip : ~w microseconds", 
-    [N, (timer:now_diff(erlang:now(), T1))/1.0e6, Sum/N]).
+    [Num, (timer:now_diff(os:timestamp(), T1))/1.0e6, Sum/Num]).
 
 many_clients(Config) ->
-  N = 75000,    % # of requests
+  Num = 75000,    % # of requests
   Dt = 0.1,    % in ms, yielding (1000/Dt) req/s
   
   Iterator = fun
@@ -318,25 +285,25 @@ many_clients(Config) ->
       erlang:send_after(trunc(Dt*M), self(), send_request),
       F(F, N-1, M+1)
   end,
-  Iterator(Iterator, N, 0),
+  Iterator(Iterator, Num, 0),
   
   Q = #cql_query{statement="INSERT INTO entries1 (id, name) values (?, ?);"},
   
-  T1 = erlang:now(),
+  T1 = os:timestamp(),
   DelayLooper = fun
     (_F, 0, 0, Acc) -> Acc;
     (F, N, M, Acc) ->
       receive
-        Msg = {result, Tag, void} -> 
+        {result, Tag, void} -> 
           {T, Client} = gb_trees:get(Tag, Acc),
           cqerl:close_client(Client),
           {Pid, _} = Client,
-          F(F, N, M-1, gb_trees:update(Tag, {Pid, timer:now_diff(erlang:now(), T)}, Acc));
+          F(F, N, M-1, gb_trees:update(Tag, {Pid, timer:now_diff(os:timestamp(), T)}, Acc));
           
         send_request ->
           Client = get_client(Config),
           Tag = cqerl:send_query(Client, Q#cql_query{values=[{id, N}, {name, "test"}]}),
-          F(F, N-1, M, gb_trees:insert(Tag, {erlang:now(), Client}, Acc));
+          F(F, N-1, M, gb_trees:insert(Tag, {os:timestamp(), Client}, Acc));
           
         OtherMsg ->
           ct:fail("Unexpected response ~p", [OtherMsg])
@@ -345,7 +312,7 @@ many_clients(Config) ->
         ct:fail("All delayed messages did not arrive in time")
       end
   end,
-  Deltas = gb_trees:to_list(DelayLooper(DelayLooper, N, N, gb_trees:empty())),
+  Deltas = gb_trees:to_list(DelayLooper(DelayLooper, Num, Num, gb_trees:empty())),
   Pids = lists:foldr(fun
       ({_, {Pid, _}}, Acc) ->
           case lists:member(Pid, Acc) of
@@ -355,9 +322,9 @@ many_clients(Config) ->
   end, [], Deltas),
     
   DistinctPids = length(Pids),
-  Sum = lists:foldr(fun ({Tag, {_, T}}, Acc) -> Acc + T end, 0, Deltas),
+  Sum = lists:foldr(fun ({_Tag, {_, T}}, Acc) -> Acc + T end, 0, Deltas),
   ct:log("~w requests sent to ~w clients over ~w seconds -- mean request roundtrip : ~w seconds", 
-    [N, DistinctPids, (timer:now_diff(erlang:now(), T1))/1.0e6, (Sum/N)/1.0e6]).
+    [Num, DistinctPids, (timer:now_diff(os:timestamp(), T1))/1.0e6, (Sum/Num)/1.0e6]).
 
 sync_insert() ->
     receive
@@ -379,7 +346,7 @@ sync_insert() ->
     end.
 
 many_sync_clients(Config) ->
-    N = 75000,
+    Num = 75000,
     Dt = 0.01,
     Iterator = fun
         (_F, 0, _M) -> ok;
@@ -388,9 +355,9 @@ many_sync_clients(Config) ->
             erlang:send_after(trunc(Dt*N), self(), {sync_request, self(),Client}),
             F(F, N-1, M+1)
         end,
-    Iterator(Iterator, N, 0),
+    Iterator(Iterator, Num, 0),
 
-    T1 = erlang:now(),
+    T1 = os:timestamp(),
     Q = #cql_query{statement="INSERT INTO entries1 (id, name) values (?, ?);", consistency=1},
     DelayLooper = fun
         (_F, 0, 0, Acc) ->
@@ -401,10 +368,10 @@ many_sync_clients(Config) ->
                     {T, Client} = gb_trees:get(Tag, Acc),
                     {Pid, _} = Client,
                     cqerl:close_client(Client),
-                    F(F, N, M-1, gb_trees:update(Tag, {Pid, timer:now_diff(erlang:now(), T)}, Acc));
+                    F(F, N, M-1, gb_trees:update(Tag, {Pid, timer:now_diff(os:timestamp(), T)}, Acc));
                 {sync_request, P, Client} ->
                     Tag = make_ref(),
-                    Now = erlang:now(),
+                    Now = os:timestamp(),
                     Pid = spawn(fun sync_insert/0),
                     Pid ! {P, {Client, Q}, Tag, N},
                     F(F, N-1, M, gb_trees:insert(Tag, {Now, Client}, Acc));
@@ -414,7 +381,7 @@ many_sync_clients(Config) ->
                 ct:fail("All delayed messages did not arrive in time~n")
             end
     end,
-    Deltas = gb_trees:to_list(DelayLooper(DelayLooper, N, N, gb_trees:empty())),
+    Deltas = gb_trees:to_list(DelayLooper(DelayLooper, Num, Num, gb_trees:empty())),
     Pids = lists:foldr(fun
         ({_, {Pid, _}}, Acc) ->
             case lists:member(Pid, Acc) of
@@ -426,21 +393,29 @@ many_sync_clients(Config) ->
     DistinctPids = length(Pids),
     Sum = lists:foldr(fun ({_Tag, {_, T}}, Acc) -> Acc + T end, 0, Deltas),
     ct:log("~w requests sent to ~w clients over ~w seconds -- mean request roundtrip : ~w seconds --~n",
-    [N, DistinctPids, (timer:now_diff(erlang:now(), T1))/1.0e6, (Sum/N)/1.0e6]).
+    [Num, DistinctPids, (timer:now_diff(os:timestamp(), T1))/1.0e6, (Sum/Num)/1.0e6]).
 
-get_client(Config) ->
-    Host = proplists:get_value(host, Config),
-    SSL = proplists:get_value(prepared_ssl, Config),
-    Auth = proplists:get_value(auth, Config, undefined),
-    Keyspace = proplists:get_value(keyspace, Config),
-    PoolMinSize = proplists:get_value(pool_min_size, Config),
-    PoolMaxSize = proplists:get_value(pool_max_size, Config),
-    
-    % io:format("Options : ~w~n", [[
-    %     {ssl, SSL}, {auth, Auth}, {keyspace, Keyspace},
-    %     {pool_min_size, 5}, {pool_max_size, 5}
-    %     ]]),
-    
-    {ok, Client} = cqerl:new_client(Host, [{ssl, SSL}, {auth, Auth}, {keyspace, Keyspace}, 
-                                           {pool_min_size, PoolMinSize}, {pool_max_size, PoolMaxSize} ]),
-    Client.
+many_concurrent_clients(Config) ->
+    Procs = 200,
+    Count = lists:seq(1, Procs),
+    Me = self(),
+    lists:foreach(fun(I) ->
+                          spawn_link(fun() -> concurrent_client(Me, I, Config) end)
+                  end,
+                  Count),
+    lists:foreach(fun(_) ->
+                          receive
+                              done -> ok
+                          end
+                  end,
+                  Count).
+
+concurrent_client(ReportTo, ID, Config) ->
+    Iters = 500,
+    Client = get_client(Config),
+    Q = #cql_query{statement="INSERT INTO entries1 (id, name) values (?, ?);", consistency=1},
+    lists:foreach(fun(I) ->
+                          {ok, void} = cqerl:run_query(Client, Q#cql_query{values=[{id, ID}, {name, integer_to_list(I)}]})
+                  end,
+                  lists:seq(1, Iters)),
+    ReportTo ! done.
