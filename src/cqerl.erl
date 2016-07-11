@@ -34,9 +34,14 @@
 
     start_link/0,
 
+    get_client/0,
+    get_client/1,
     get_client/2,
+    
     get_global_opts/0,
-    make_option_getter/2
+    make_option_getter/2,
+
+    prepare_node_info/1
 ]).
 
 -export([
@@ -46,7 +51,10 @@
 
     handle_call/3,
     handle_cast/2,
-    handle_info/2
+    handle_info/2,
+
+    get_protocol_version/0,
+    put_protocol_version/1
 ]).
 
 
@@ -54,11 +62,12 @@
 
 -opaque client() :: {pid(), reference()}.
 
--type inet() :: { inet:ip_address() | string(), Port :: integer() }.
+-type inet() :: { inet:ip_address() | string(), Port :: integer() } | inet:ip_address() | string() | binary() | {}.
 
 -export_type([client/0, inet/0]).
 
 -define(SEED, {erlang:unique_integer([positive]), erlang:unique_integer([positive]), erlang:unique_integer([positive])}).
+-define(IPV4_RE, <<"^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(?::([0-9]{1,5}))?$">>).
 
 -record(cql_client_stats, {
     min_count :: integer(),
@@ -85,7 +94,9 @@
 -define(RETRY_MAX_DELAY, 1000).
 -define(RETRY_EXP_FACT, 1.15).
 
+-define(DEFAULT_QUERY_RETRY, 2).
 -define(DEFAULT_PORT, 9042).
+-define(LOCALHOST, "127.0.0.1").
 
 -spec prepare_client(Inet :: inet(), Opts :: list(tuple() | atom())) -> ok.
 prepare_client(Inet, Opts) ->
@@ -113,10 +124,29 @@ new_client(Inet, Opts) ->
     gen_server:call(?MODULE, {get_client, prepare_node_info(Inet), Opts}).
 
 
+
+
 % Use in `hash' mode
--spec get_client(Inet :: inet() | {}, Opts :: list(tuple() | atom())) -> {ok, client()} | {error, term()}.
+
+-spec get_client() -> {ok, client()} | {error, term()}.
+get_client() ->
+    cqerl_cluster:get_any_client().
+
+-spec get_client(ClusterKeyOrInet :: atom() | inet()) -> {ok, client()} | {error, term()}.
+
+get_client(ClusterKey) when is_atom(ClusterKey) ->
+    cqerl_cluster:get_any_client(ClusterKey);
+
+get_client({}) ->
+    cqerl_hash:get_client(prepare_node_info({?LOCALHOST, ?DEFAULT_PORT}), []);
+
+get_client(Spec) ->
+    cqerl_hash:get_client(prepare_node_info(Spec), []).
+
+-spec get_client(Inet :: inet(), Opts :: list(tuple() | atom())) -> {ok, client()} | {error, term()}.
 get_client(Spec, Opts) ->
-    cqerl_hash:get_client({Spec, Opts}).
+    cqerl_hash:get_client(prepare_node_info(Spec), Opts).
+
 
 
 %% @doc Close a client that was previously allocated with {@link new_client/0} or {@link new_client/1}.
@@ -130,8 +160,8 @@ close_client(ClientRef) ->
 
 
 
-%% @doc Fetch the next page of result from Cassandra for a given continuation. The function will
-%%            return with the result from Cassandra (synchronously).
+%% @doc Send a query to cassandra for execution. The function will return with the result from Cassandra (synchronously).
+%%
 %% The <code>Query</code> parameter can be a string, a binary UTF8 string or a <code>#cql_query{}</code> record
 %%
 %% <pre>#cql_query{
@@ -150,14 +180,29 @@ close_client(ClientRef) ->
 %% <code>two</code>, <code>three</code>, <code>quorum</code>, <code>all</code>, <code>local_quorum</code>, <code>each_quorum</code>, <code>serial</code>,
 %% <code>local_serial</code> or <code>local_one</code>.
 %%
-%% How <em>bindings</em> is used depends on the <em>named</em> value. <em>Named</em> is a boolean value indicating whether the parameters in the query are named parameters (<code>:var1</code>). Otherwise,
-%% they are assumed to be positional (<code>?</code>). In the first case, <em>bindings</em> is a property list (see <a href="http://www.erlang.org/doc/man/proplists.html">proplists</a>) where keys match the
-%% parameter names. In the latter case, <em>bindings</em> should be a simple list of values.
+%% How <em>values</em> is used depends on the <em>named</em> value. <em>Named</em> is a boolean value indicating whether the parameters in the query are named parameters (<code>:var1</code>). Otherwise,
+%% they are assumed to be positional (<code>?</code>). In both cases, <em>values</em> is a property list (see <a href="http://www.erlang.org/doc/man/proplists.html">proplists</a>) or map, where keys match the
+%% parameter names. 
 
 -spec run_query(ClientRef :: client(), Query :: binary() | string() | #cql_query{} | #cql_query_batch{}) -> {ok, void} | {ok, #cql_result{}} | {error, term()}.
 run_query(ClientRef, Query) ->
-    cqerl_client:run_query(ClientRef, Query).
+    run_query(ClientRef, Query, ?DEFAULT_QUERY_RETRY).
 
+-spec run_query(ClientRef :: client(), Query :: binary() | string() | #cql_query{} | #cql_query_batch{}, non_neg_integer()) -> {ok, void} | {ok, #cql_result{}} | {error, term()}.
+run_query(ClientRef, Query, Retry) when Retry =< 0->
+    cqerl_client:run_query(ClientRef, Query);
+
+run_query(ClientRef, Query, Retry) ->
+    case cqerl_client:run_query(ClientRef, Query) of
+        {error, {16#1100, _, _}} -> %% Write timeout
+            error_logger:info_msg("Cassandra write timeout, retrying retry=~p", [Retry]),
+            run_query(ClientRef, Query, Retry - 1);
+        {error, {16#1200, _, _}} -> %% Read timeout
+            error_logger:info_msg("Cassandra read timeout, retrying retry=~p", [Retry]),
+            run_query(ClientRef, Query, Retry - 1);
+        Response -> 
+            Response
+    end.
 
 
 
@@ -479,11 +524,13 @@ new_pool(NodeKey={Ip, Port, Keyspace}, LocalOpts, GlobalOpts, State=#cqerl_state
                      {max_count,       OptGetter(pool_max_size)},
                      {cull_interval,   OptGetter(pool_cull_interval)},
                      {max_age,         {Amount/2, Unit}},
-                     {start_mfa,       {cqerl_client, start_link, [{Ip, Port},
-                                           [  {auth, OptGetter(auth)},
-                                              {ssl, OptGetter(ssl)},
+                     {start_mfa,       {cqerl_client, start_link, [
+                                           {Ip, Port},
+                                           [  {ssl, OptGetter(ssl)},
                                               {sleep_duration, {Amount/2, Unit}},
-                                              {keyspace, Keyspace} ]
+                                              {keyspace, Keyspace}
+                                           ],
+                                           OptGetter
                                         ]}
                      }
                    ]),
@@ -507,7 +554,7 @@ get_global_opts() ->
                 {ok, V} -> {Key, V}
             end
         end,
-        [ssl, auth, pool_min_size, pool_max_size, pool_cull_interval, client_max_age, keyspace, name]
+        [ssl, auth, protocol_version, pool_min_size, pool_max_size, pool_cull_interval, client_max_age, keyspace, name]
     ).
 
 prepare_configured_pools(State=#cqerl_state{checked_env=false}) ->
@@ -559,7 +606,8 @@ make_option_getter(Local, Global) ->
                             auth -> {cqerl_auth_plain_handler, []};
                             ssl -> false;
                             keyspace -> undefined;
-                            name -> undefined
+                            name -> undefined;
+                            protocol_version -> ?DEFAULT_PROTOCOL_VERSION
                         end;
                     GlobalVal -> GlobalVal
                 end;
@@ -624,10 +672,30 @@ prepare_node_info({TupleAddr, Port}) when is_tuple(TupleAddr) andalso erlang:siz
     {TupleAddr, Port};
 
 prepare_node_info(Addr) when is_atom(Addr);
-                             is_list(Addr);
                              is_tuple(Addr) andalso erlang:size(Addr) == 4;    % v4
                              is_tuple(Addr) andalso erlang:size(Addr) == 8 ->  % v6
-    prepare_node_info({Addr, ?DEFAULT_PORT}).
+    prepare_node_info({Addr, ?DEFAULT_PORT});
+
+prepare_node_info(Addr) when is_binary(Addr) ->
+    case re2:match(Addr, ?IPV4_RE) of
+        {match, [_, IP, <<>>]} ->
+            prepare_node_info({binary_to_list(IP), ?DEFAULT_PORT});
+        {match, [_, IP, Port]} ->
+            {PortInt, []} = string:to_integer(binary_to_list(Port)),
+            prepare_node_info({binary_to_list(IP), PortInt});
+        nomatch ->
+            prepare_node_info({binary_to_list(Addr), ?DEFAULT_PORT})
+    end;
+prepare_node_info(Addr) when is_list(Addr) ->
+    case re2:match(Addr, ?IPV4_RE) of
+        {match, [_, IP, <<>>]} ->
+            prepare_node_info({binary_to_list(IP), ?DEFAULT_PORT});
+        {match, [_, IP, Port]} ->
+            {PortInt, []} = string:to_integer(binary_to_list(Port)),
+            prepare_node_info({binary_to_list(IP), PortInt});
+        nomatch ->
+            prepare_node_info({Addr, ?DEFAULT_PORT})
+    end.
 
 -spec pool_from_node(Node :: {inet:ip_address() | string(), integer() | string() | binary(), atom()}) -> atom().
 
@@ -638,6 +706,24 @@ pool_from_node({ Addr, Port, Keyspace }) when is_binary(Port) ->
     pool_from_node({ Addr, binary_to_list(Port), Keyspace });
 pool_from_node(Node = { Addr, Port, Keyspace }) when is_tuple(Addr) orelse is_list(Addr), is_integer(Port), is_atom(Keyspace) ->
     binary_to_atom(base64:encode(term_to_binary(Node)), latin1).
+
+
+-spec get_protocol_version() -> integer().
+
+get_protocol_version() ->
+    case get(protocol_version) of
+        undefined ->
+            ProtocolVersion0 = application:get_env(cqerl, protocol_version, ?DEFAULT_PROTOCOL_VERSION),
+            put(protocol_version, ProtocolVersion0),
+            ProtocolVersion0;
+        ProtocolVersion0 -> 
+            ProtocolVersion0
+    end.
+
+-spec put_protocol_version(integer()) -> ok.
+
+put_protocol_version(Val) when is_integer(Val) ->
+    put(protocol_version, Val).
 
 dec_stats_count(NodeKey, Stats) ->
     case orddict:find(NodeKey, Stats) of

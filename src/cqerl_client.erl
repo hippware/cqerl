@@ -8,10 +8,9 @@
 %% API Function Exports
 %% ------------------------------------------------------------------
 
--export([start_link/2, start_link/3, new_user/2, remove_user/1,
+-export([start_link/3, start_link/4, new_user/2, remove_user/1,
          run_query/2, query_async/2, fetch_more/1, fetch_more_async/1,
-         prepare_query/2,
-         batch_ready/2]).
+         prepare_query/2, batch_ready/2, make_key/2]).
 
 %% ------------------------------------------------------------------
 %% gen_fsm Function Exports
@@ -70,11 +69,11 @@ end).
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-start_link(Inet, Opts) ->
-    gen_fsm:start_link(?MODULE, [Inet, Opts, undefined], []).
+start_link(Inet, Opts, OptGetter) ->
+    gen_fsm:start_link(?MODULE, [Inet, Opts, OptGetter, undefined], []).
 
-start_link(Inet, Opts, Key) ->
-    gen_fsm:start_link(?MODULE, [Inet, Opts, Key], []).
+start_link(Inet, Opts, OptGetter, Key) ->
+    gen_fsm:start_link(?MODULE, [Inet, Opts, OptGetter, Key], []).
 
 new_user(Pid, From) ->
     case cqerl_app:mode() of
@@ -117,27 +116,50 @@ fetch_more_async(Continuation=#cql_result{client={ClientPid, ClientRef}}) ->
     QueryRef.
 
 prepare_query(ClientPid, Query) ->
-    gen_fsm:send_event(ClientPid, {prepare_query, Query}).
+    % We don't want the cqerl_cache process to crash if our client has gone away,
+    % so wrap in a try-catch
+    try
+        gen_fsm:send_event(ClientPid, {prepare_query, Query})
+    catch
+        _:_ -> ok
+    end.
 
 batch_ready({ClientPid, Call}, QueryBatch) ->
     gen_fsm:send_event(ClientPid, {batch_ready, Call, QueryBatch}).
+
+make_key(Node, Opts) ->
+    SafeOpts =
+    case lists:keytake(auth, 1, Opts) of
+        {value, {auth, Auth}, Opts1} -> [{auth_hash, erlang:phash2(Auth)} | Opts1];
+        false -> Opts
+    end,
+    NormalisedOpts = normalise_keyspace(SafeOpts),
+    {Node, lists:usort(NormalisedOpts)}.
+
+normalise_keyspace(Opts) ->
+    KS = proplists:get_value(keyspace, Opts),
+    [{keyspace, normalise_to_atom(KS)} | proplists:delete(keyspace, Opts)].
+
+normalise_to_atom(KS) when is_list(KS) -> list_to_atom(KS);
+normalise_to_atom(KS) when is_binary(KS) -> binary_to_atom(KS, latin1);
+normalise_to_atom(KS) when is_atom(KS) -> KS.
 
 %% ------------------------------------------------------------------
 %% gen_fsm Function Definitions
 %% ------------------------------------------------------------------
 
-init([Inet, Opts, Key]) ->
+init([Inet, Opts, OptGetter, Key]) ->
     case create_socket(Inet, Opts) of
         {ok, Socket, Transport} ->
-            {auth, {AuthHandler, AuthArgs}} = proplists:lookup(auth, Opts),
+            {AuthHandler, AuthArgs} = OptGetter(auth),
+            cqerl:put_protocol_version(OptGetter(protocol_version)),
             {ok, OptionsFrame} = cqerl_protocol:options_frame(#cqerl_frame{}),
-            put(uuidstate, uuid:new(self())),
             State = #client_state{
                 socket=Socket, trans=Transport, inet=Inet,
                 authmod=AuthHandler, authargs=AuthArgs,
                 users=[],
                 sleep=get_sleep_duration(Opts),
-                keyspace=proplists:get_value(keyspace, Opts),
+                keyspace=normalise_to_atom(proplists:get_value(keyspace, Opts)),
                 key=Key,
                 mode=cqerl_app:mode()
             },
@@ -267,6 +289,9 @@ handle_info({processor_threw, {Error, {Query, Call}}}, live,
         {rows, _} ->
             {UserCall, _} = Query,
             respond_to_user(UserCall, {error, Error}),
+            {next_state, live, State};
+
+        {prepared, _rest} ->
             {next_state, live, State}
     end;
 
@@ -403,7 +428,7 @@ handle_info({ Transport, Socket, BinaryMsg }, live, State = #client_state{ socke
             case orddict:find(StreamID, State#client_state.queries) of
                 {ok, undefined} -> ok;
                 {ok, UserQuery} ->
-                    cqerl_processor_sup:new_processor(UserQuery, {rows, RawMsg})
+                    cqerl_processor_sup:new_processor(UserQuery, {rows, RawMsg}, cqerl:get_protocol_version())
             end,
             {next_state, live, release_stream_id(StreamID, State)};
 
@@ -417,7 +442,7 @@ handle_info({ Transport, Socket, BinaryMsg }, live, State = #client_state{ socke
         {ok, #cqerl_frame{opcode=?CQERL_OP_RESULT, stream_id=StreamID}, {prepared, RawMsg}, Delayed} ->
             case orddict:find(StreamID, State#client_state.queries) of
                 {ok, {preparing, Query}} ->
-                    cqerl_processor_sup:new_processor(Query, {prepared, RawMsg});
+                    cqerl_processor_sup:new_processor(Query, {prepared, RawMsg}, cqerl:get_protocol_version());
                 {ok, undefined} -> ok
             end,
             {next_state, live, release_stream_id(StreamID, State)};
@@ -552,6 +577,10 @@ dequeue_query(State0=#client_state{queued=Queue0}) ->
             State1 = process_outgoing_query(Call, Batch, State0),
             {true, State1#client_state{queued=Queue1}};
 
+        {{value, {prepare, Query}}, Queue1} when is_binary(Query) ->
+            State1 = process_outgoing_query(prepare, Query, State0),
+            {true, State1#client_state{queued=Queue1}};
+
         {{value, {Call, Item}}, Queue1} ->
             case Item of
                 Query=#cql_query{} -> ok;
@@ -654,7 +683,8 @@ process_outgoing_query(Call,
     end,
     cqerl_processor_sup:new_processor(
         { State#client_state.trans, State#client_state.socket, CachedResult },
-        { send, BaseFrame, Values, Query, SkipMetadata }
+        { send, BaseFrame, Values, Query, SkipMetadata },
+        cqerl:get_protocol_version()
     ),
     maybe_signal_busy(State2 = State1#client_state{queries=Queries1}),
     State2.
@@ -827,7 +857,6 @@ choose_cql_version({'CQL_VERSION', Versions}) ->
     case application:get_env(cqerl, preferred_cql_version, undefined) of
         undefined ->
             [GreaterVersion|_] = SemVersions;
-
         Version1 ->
             [GreaterVersion|_] = lists:dropwhile(fun (SemVersion) ->
                 case semver:compare(SemVersion, Version1) of
@@ -835,7 +864,6 @@ choose_cql_version({'CQL_VERSION', Versions}) ->
                     _ -> false
                 end
             end, SemVersions)
-
     end,
     [_v | Version] = semver:vsn_string(GreaterVersion),
     list_to_binary(Version).
